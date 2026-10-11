@@ -1,7 +1,10 @@
 import axios from "axios";
 
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") || "/api";
+
 export const api = axios.create({
-  baseURL: "/api",
+  baseURL: API_BASE_URL,
   timeout: 60000,
 });
 
@@ -15,7 +18,7 @@ export type RouteRequest = {
   destination: string;
   departureTime: string;
   loadWeight: number;
-  checkpointInterval: 10 | 25 | 50;
+  checkpointInterval: number;
 };
 
 export type CheckpointWeather = {
@@ -106,7 +109,6 @@ export type RouteResponse = {
 
 export async function generateRoutes(payload: RouteRequest) {
   const response = await api.post<RouteResponse>("/routes/", payload);
-
   return response.data;
 }
 
