@@ -137,7 +137,7 @@ export default function RouteMap({ data }: Props) {
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: "https://tiles.openfreemap.org/styles/liberty",
+      style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
       center: [-74.5, 40.4],
       zoom: 8,
     });
