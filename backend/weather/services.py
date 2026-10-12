@@ -1,16 +1,11 @@
 
-"""
-Weather forecast services for Spotter Routing.
-"""
-
+cat > backend/weather/services.py <<'PY'
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import requests
-from requests.adapters import HTTPAdapter
+from django.core.cache import cache
 from requests.exceptions import RequestException
-from urllib3.util.retry import Retry
-
 
 logger = logging.getLogger(__name__)
 
@@ -26,189 +21,172 @@ HOURLY_FIELDS = [
     "weather_code",
 ]
 
+CACHE_SECONDS = 900
+BATCH_SIZE = 20
+
 
 class WeatherError(Exception):
     pass
 
 
-def fetch_weather(latitude, longitude):
+def fetch_weather_batch(coordinates):
     """
-    Fetch hourly weather data from Open-Meteo.
-
-    Retries temporary server errors and rate limits.
-    Logs the underlying failure for debugging.
+    Coordinates are (latitude, longitude) pairs.
+    Returns forecast datasets in the same order.
     """
+    if not coordinates:
+        return []
 
-    session = requests.Session()
+    results = [None] * len(coordinates)
+    missing = []
 
-    retries = Retry(
-        total=2,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
+    for index, (latitude, longitude) in enumerate(coordinates):
+        key = f"spotter_weather_v2:{latitude:.5f}:{longitude:.5f}"
+        cached = cache.get(key)
 
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("https://", adapter)
+        if cached is not None:
+            results[index] = cached
+        else:
+            missing.append((index, latitude, longitude, key))
 
-    try:
-        response = session.get(
-            OPEN_METEO_URL,
-            params={
-                "latitude": latitude,
-                "longitude": longitude,
-                "hourly": ",".join(HOURLY_FIELDS),
-                "wind_speed_unit": "mph",
-                "temperature_unit": "fahrenheit",
-                "precipitation_unit": "inch",
-                "timezone": "UTC",
-                "forecast_days": 3,
-            },
-            timeout=(10, 25),
-            headers={
-                "User-Agent": "SpotterRouting/1.0",
-                "Accept": "application/json",
-            },
-        )
+    for start in range(0, len(missing), BATCH_SIZE):
+        batch = missing[start:start + BATCH_SIZE]
 
-        if not response.ok:
-            logger.error(
-                "Open-Meteo HTTP %s: %s",
-                response.status_code,
-                response.text[:500],
+        params = {
+            "latitude": ",".join(str(item[1]) for item in batch),
+            "longitude": ",".join(str(item[2]) for item in batch),
+            "hourly": ",".join(HOURLY_FIELDS),
+            "wind_speed_unit": "mph",
+            "temperature_unit": "fahrenheit",
+            "precipitation_unit": "inch",
+            "timezone": "UTC",
+            "forecast_days": 3,
+        }
+
+        try:
+            response = requests.get(
+                OPEN_METEO_URL,
+                params=params,
+                timeout=30,
             )
 
-        response.raise_for_status()
-        data = response.json()
+            if response.status_code == 429:
+                logger.warning("Open-Meteo rate limit (HTTP 429)")
+                raise WeatherError(
+                    "Weather provider rate limit reached."
+                )
 
-        hourly = data.get("hourly", {})
-        times = hourly.get("time", [])
+            response.raise_for_status()
+            payload = response.json()
 
-        if not times:
+            if isinstance(payload, dict):
+                payload = [payload]
+
+            if not isinstance(payload, list) or len(payload) != len(batch):
+                raise WeatherError(
+                    "Unexpected weather provider response."
+                )
+
+            for item, dataset in zip(batch, payload):
+                index, latitude, longitude, key = item
+
+                if not isinstance(dataset, dict) or not isinstance(
+                    dataset.get("hourly"), dict
+                ):
+                    raise WeatherError(
+                        "Incomplete weather forecast response."
+                    )
+
+                results[index] = dataset
+                cache.set(key, dataset, CACHE_SECONDS)
+
+        except WeatherError:
+            raise
+        except (RequestException, ValueError, TypeError) as exc:
+            logger.warning("Weather request failed: %s", exc)
             raise WeatherError(
-                "Weather provider returned no hourly forecasts."
-            )
+                "Unable to retrieve weather forecast."
+            ) from exc
 
-        for field in HOURLY_FIELDS:
-            values = hourly.get(field)
-
-            if not isinstance(values, list):
-                raise WeatherError(
-                    f"Weather provider omitted field: {field}"
-                )
-
-            if len(values) != len(times):
-                raise WeatherError(
-                    f"Weather provider returned incomplete field: {field}"
-                )
-
-        return hourly
-
-    except (RequestException, ValueError) as exc:
-        logger.exception(
-            "Open-Meteo request failed for latitude=%s longitude=%s",
-            latitude,
-            longitude,
-        )
-
-        raise WeatherError(
-            "Unable to retrieve weather forecast."
-        ) from exc
-
-    finally:
-        session.close()
+    return results
 
 
-def parse_forecast_time(value):
-    return datetime.fromisoformat(value).replace(
-        tzinfo=timezone.utc
-    )
+def fetch_weather(latitude, longitude):
+    return fetch_weather_batch([(latitude, longitude)])[0]
 
 
-def format_weather(hourly, index, forecast_time):
-    return {
-        "forecast_time": forecast_time.isoformat(),
-        "temperature_f": hourly["temperature_2m"][index],
-        "precipitation_inches": hourly["precipitation"][index],
-        "rain_inches": hourly["rain"][index],
-        "snowfall_cm": hourly["snowfall"][index],
-        "wind_speed_mph": hourly["wind_speed_10m"][index],
-        "wind_gusts_mph": hourly["wind_gusts_10m"][index],
-        "weather_code": hourly["weather_code"][index],
-    }
+def forecast_at_arrival(dataset, arrival_time):
+    hourly = dataset["hourly"]
+    times = hourly["time"]
 
-
-def get_checkpoint_weather(
-    latitude,
-    longitude,
-    arrival_time,
-):
-    """
-    Retrieve forecast weather at a checkpoint's arrival time.
-    """
+    if not times:
+        raise WeatherError("No forecast hours available.")
 
     if arrival_time.tzinfo is None:
-        raise WeatherError(
-            "Arrival time must include timezone information."
-        )
+        raise WeatherError("Arrival time must include a timezone.")
 
-    hourly = fetch_weather(latitude, longitude)
+    target = arrival_time.astimezone(timezone.utc).replace(tzinfo=None)
 
-    forecast_times = [
-        parse_forecast_time(value)
-        for value in hourly["time"]
-    ]
+    parsed_times = [datetime.fromisoformat(value) for value in times]
 
-    target_time = arrival_time.astimezone(timezone.utc)
-
-    nearest_index = min(
-        range(len(forecast_times)),
+    closest_index = min(
+        range(len(parsed_times)),
         key=lambda index: abs(
-            forecast_times[index] - target_time
+            (parsed_times[index] - target).total_seconds()
         ),
     )
 
-    nearest_time = forecast_times[nearest_index]
-
-    if abs(nearest_time - target_time) > timedelta(hours=1):
+    # Do not silently use stale forecasts for distant dates.
+    if abs(
+        (parsed_times[closest_index] - target).total_seconds()
+    ) > 3600:
         raise WeatherError(
-            "Weather forecast is unavailable for the requested arrival time."
+            "Arrival time is outside the available forecast."
         )
 
-    return format_weather(
-        hourly,
-        nearest_index,
-        nearest_time,
-    )
+    def field(name):
+        values = hourly.get(name, [])
+        return values[closest_index] if closest_index < len(values) else None
+
+    return {
+        "forecast_time": times[closest_index],
+        "temperature_f": field("temperature_2m"),
+        "precipitation_inches": field("precipitation"),
+        "rain_inches": field("rain"),
+        "snowfall_cm": field("snowfall"),
+        "wind_speed_mph": field("wind_speed_10m"),
+        "wind_gusts_mph": field("wind_gusts_10m"),
+        "weather_code": field("weather_code"),
+    }
+
+
+def get_checkpoint_weather(latitude, longitude, arrival_time):
+    dataset = fetch_weather(latitude, longitude)
+    return forecast_at_arrival(dataset, arrival_time)
 
 
 def get_48_hour_forecast(latitude, longitude):
-    """
-    Retrieve the next 48 hourly forecasts in UTC.
-    """
+    dataset = fetch_weather(latitude, longitude)
+    hourly = dataset["hourly"]
 
-    hourly = fetch_weather(latitude, longitude)
-
-    now = datetime.now(timezone.utc)
-
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     forecasts = []
 
-    for index, value in enumerate(hourly["time"]):
-        forecast_time = parse_forecast_time(value)
+    for time_string in hourly.get("time", []):
+        forecast_time = datetime.fromisoformat(time_string)
 
-        if forecast_time < now:
+        if forecast_time <= now:
             continue
 
         forecasts.append(
-            format_weather(hourly, index, forecast_time)
+            forecast_at_arrival(
+                dataset,
+                forecast_time.replace(tzinfo=timezone.utc),
+            )
         )
 
         if len(forecasts) == 48:
             break
 
-    if len(forecasts) < 48:
-        raise WeatherError(
-            "The forecast provider returned fewer than 48 future hours."
-        )
-
     return forecasts
+PY
