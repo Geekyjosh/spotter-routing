@@ -149,6 +149,19 @@ class WeatherRiskTests(SimpleTestCase):
             result["severity"],
             "unknown",
         )
+        
+    def test_rain_exact_no_travel_boundary(self):
+        self.check_severity("severe", rain=1.0)
+
+    def test_rain_above_no_travel_boundary(self):
+        self.check_severity("no_travel", rain=1.01)
+
+    def test_snow_exact_no_travel_boundary(self):
+        self.check_severity("severe", snow=3.0)
+
+    def test_snow_above_no_travel_boundary(self):
+        self.check_severity("no_travel", snow=3.01)
+
 
 
 class RouteRecommendationTests(SimpleTestCase):

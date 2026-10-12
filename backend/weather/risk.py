@@ -1,14 +1,9 @@
 
 def _risk_band(value, thresholds):
-    if value >= thresholds[3]:
-        return 4
-    if value >= thresholds[2]:
-        return 3
-    if value >= thresholds[1]:
-        return 2
-    if value >= thresholds[0]:
-        return 1
-    return 0
+    for index, threshold in enumerate(thresholds):
+        if value < threshold:
+            return index
+    return len(thresholds)
 
 
 def calculate_checkpoint_risk(weather, load_weight_lbs):
@@ -20,13 +15,22 @@ def calculate_checkpoint_risk(weather, load_weight_lbs):
             "factors": ["Weather forecast unavailable"],
         }
 
+    wind_speed = weather.get("wind_speed_mph")
+    wind_gusts = weather.get("wind_gusts_mph")
+
+    if wind_speed is None and wind_gusts is None:
+        return {
+            "score": None,
+            "level": "unknown",
+            "severity": "unknown",
+            "factors": ["Wind forecast unavailable"],
+        }
+
     wind = max(
-        weather.get("wind_speed_mph") or 0,
-        weather.get("wind_gusts_mph") or 0,
+        wind_speed or 0,
+        wind_gusts or 0,
     )
 
-    # These fields will be provided by the
-    # updated weather service.
     rain = weather.get("rain_inches_per_hour")
     snow = weather.get("snow_inches_per_hour")
 
@@ -44,13 +48,26 @@ def calculate_checkpoint_risk(weather, load_weight_lbs):
         wind, (25, 35, 45, 55)
     )
 
+    # The final threshold is exclusive:
+    # exactly 1.0 rain / 3.0 snow is Severe.
     rain_band = _risk_band(
-        rain, (0.10, 0.25, 0.50, 1.0)
+        rain, (0.10, 0.25, 0.50, 1.000000001)
     )
 
     snow_band = _risk_band(
-        snow, (0.5, 1.0, 2.0, 3.0)
+        snow, (0.5, 1.0, 2.0, 3.000000001)
     )
+
+    # Handle the exact boundary explicitly.
+    if rain > 1.0:
+        rain_band = 4
+    elif rain >= 0.50:
+        rain_band = 3
+
+    if snow > 3.0:
+        snow_band = 4
+    elif snow >= 2.0:
+        snow_band = 3
 
     factors = []
 
@@ -63,7 +80,6 @@ def calculate_checkpoint_risk(weather, load_weight_lbs):
     if snow_band:
         factors.append(f"Snow: {snow:.2f} in/hr")
 
-    # Assessment load rules
     if wind >= 55:
         wind_band = 4
         factors.append("No travel: wind >=55 mph")
@@ -94,7 +110,7 @@ def calculate_checkpoint_risk(weather, load_weight_lbs):
         "no_travel",
     ]
 
-    # Keep frontend-compatible risk levels.
+    # Preserve the existing frontend API contract.
     display_levels = [
         "low",
         "moderate",
@@ -113,9 +129,7 @@ def calculate_checkpoint_risk(weather, load_weight_lbs):
 
 def score_routes(routes, load_weight_lbs):
     for route in routes:
-        checkpoints = route.get(
-            "checkpoints", []
-        )
+        checkpoints = route.get("checkpoints", [])
 
         known_scores = []
         unknown_count = 0
@@ -136,6 +150,8 @@ def score_routes(routes, load_weight_lbs):
 
             known_scores.append(risk["score"])
 
+            # Assign each checkpoint's risk to the
+            # segment immediately following it.
             if index + 1 < len(checkpoints):
                 segment_miles = max(
                     0.0,
@@ -154,15 +170,21 @@ def score_routes(routes, load_weight_lbs):
             elif risk["severity"] == "high":
                 high_miles += segment_miles
 
-        if known_scores:
-            average_score = round(
-                sum(known_scores) / len(known_scores),
-                1,
-            )
-            maximum_score = max(known_scores)
-        else:
-            average_score = None
-            maximum_score = None
+        # The destination is already included by
+        # generate_checkpoints(), so no extra segment
+        # is added beyond the final checkpoint.
+
+        average_score = (
+            round(sum(known_scores) / len(known_scores), 1)
+            if known_scores
+            else None
+        )
+
+        maximum_score = (
+            max(known_scores)
+            if known_scores
+            else None
+        )
 
         route["risk_summary"] = {
             "average_score": average_score,
