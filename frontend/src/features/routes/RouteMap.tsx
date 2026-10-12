@@ -5,7 +5,7 @@ import {
   type HourlyWeatherForecast,
   type RouteResponse,
 } from "../../lib/api";
-
+import type * as GeoJSON from "geojson";
 type Props = {
   data: RouteResponse | null;
 };
@@ -17,6 +17,9 @@ type ForecastPoint = {
 
 const ROUTE_COLORS = ["#0891b2", "#2563eb", "#64748b"];
 const RECOMMENDED_COLOR = "#087F8C";
+
+const HEAT_SOURCE = "weather-risk-heat-source";
+const HEAT_LAYER = "weather-risk-heat-layer";
 
 function riskColor(level: string) {
   switch (level) {
@@ -41,13 +44,8 @@ function getForecastRisk(forecast: HourlyWeatherForecast, loadWeight: number) {
     forecast.wind_gusts_mph ?? 0,
   );
 
-  // OpenWeatherMap forecast precipitation is a
-  // three-hour accumulation, not an hourly rate.
-  const rain = (forecast.rain_inches ?? 0) / 3;
-
-  // Approximate snowfall depth rate from the
-  // provider's reported 3-hour snow quantity.
-  const snow = (forecast.snowfall_cm ?? 0) / 2.54 / 3;
+  const rain = forecast.rain_inches_per_hour ?? 0;
+  const snow = forecast.snow_inches_per_hour ?? 0;
 
   if (
     wind >= 55 ||
@@ -78,6 +76,21 @@ function getForecastRisk(forecast: HourlyWeatherForecast, loadWeight: number) {
   return "low";
 }
 
+function riskIntensity(level: string) {
+  switch (level) {
+    case "no_travel":
+      return 1;
+    case "severe":
+      return 0.85;
+    case "high":
+      return 0.65;
+    case "moderate":
+      return 0.4;
+    default:
+      return 0.15;
+  }
+}
+
 function nearestForecast(
   forecasts: HourlyWeatherForecast[],
   targetTime: number,
@@ -100,8 +113,8 @@ function nearestForecast(
 export default function RouteMap({ data }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
+
   const routeMarkersRef = useRef<maplibregl.Marker[]>([]);
-  const heatMarkersRef = useRef<maplibregl.Marker[]>([]);
   const routeLayersRef = useRef<string[]>([]);
   const routeSourcesRef = useRef<string[]>([]);
 
@@ -118,7 +131,7 @@ export default function RouteMap({ data }: Props) {
       (route) => route.id === data.recommendation?.recommended_route_id,
     ) ?? data?.routes[0];
 
-  // Create the map once.
+  // Initialize the map once.
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -144,7 +157,7 @@ export default function RouteMap({ data }: Props) {
     };
   }, []);
 
-  // Draw the three routes and checkpoint markers.
+  // Draw routes and checkpoint markers.
   useEffect(() => {
     const map = mapRef.current;
 
@@ -209,8 +222,10 @@ export default function RouteMap({ data }: Props) {
       });
 
       route.checkpoints.forEach((checkpoint) => {
-        const color = riskColor(checkpoint.risk?.level ?? "unknown");
+        const severity =
+          checkpoint.risk?.severity ?? checkpoint.risk?.level ?? "unknown";
 
+        const color = riskColor(severity);
         const weather = checkpoint.weather;
 
         const popup = new maplibregl.Popup({
@@ -227,7 +242,7 @@ export default function RouteMap({ data }: Props) {
         const details = [
           `Distance: ${checkpoint.distance_miles} miles`,
           `Arrival: ${new Date(checkpoint.estimated_arrival).toLocaleString()}`,
-          `Risk: ${checkpoint.risk?.level ?? "unknown"}`,
+          `Risk: ${severity.replaceAll("_", " ")}`,
           `Risk score: ${checkpoint.risk?.score ?? "N/A"}`,
           weather
             ? `Wind: ${weather.wind_speed_mph ?? "N/A"} mph`
@@ -296,8 +311,7 @@ export default function RouteMap({ data }: Props) {
     }
   }, [data, mapReady]);
 
-  // Fetch the next 48 hours of forecasts at
-  // checkpoints along the recommended route.
+  // Load forecasts along the recommended route.
   useEffect(() => {
     let cancelled = false;
 
@@ -342,15 +356,12 @@ export default function RouteMap({ data }: Props) {
       setForecastPoints(available);
 
       if (available.length) {
-        const earliestForecast = Math.min(
-          ...available.flatMap((point) =>
-            point.forecasts.map((forecast) =>
-              new Date(forecast.forecast_time).getTime(),
-            ),
-          ),
-        );
+        // Anchor the timeline to the current hour.
+        // Forecasts remain sampled at provider intervals.
+        const now = Date.now();
+        const currentHour = Math.floor(now / 3600000) * 3600000;
 
-        setForecastBaseTime(earliestForecast);
+        setForecastBaseTime(currentHour);
       } else {
         setForecastError(
           "Forecast overlay unavailable. Route planning remains available.",
@@ -367,67 +378,138 @@ export default function RouteMap({ data }: Props) {
     };
   }, [recommendedRoute]);
 
-  // Draw a colored weather-risk overlay around
-  // each sampled forecast checkpoint.
+  // Render a real MapLibre heatmap using GeoJSON points.
   useEffect(() => {
     const map = mapRef.current;
 
-    heatMarkersRef.current.forEach((marker) => marker.remove());
-    heatMarkersRef.current = [];
+    if (!map || !mapReady) return;
 
-    if (
-      !map ||
-      !mapReady ||
-      !showHeatmap ||
-      !forecastPoints.length ||
+    const targetTime =
       forecastBaseTime === null
-    ) {
-      return;
+        ? null
+        : forecastBaseTime + forecastHour * 60 * 60 * 1000;
+
+    const features: GeoJSON.Feature<
+      GeoJSON.Point,
+      { intensity: number; risk: string }
+    >[] = [];
+
+    if (showHeatmap && targetTime !== null && forecastPoints.length) {
+      forecastPoints.forEach((point) => {
+        const forecast = nearestForecast(point.forecasts, targetTime);
+
+        if (!forecast) return;
+
+        const forecastTime = new Date(forecast.forecast_time).getTime();
+
+        if (Math.abs(forecastTime - targetTime) > 3 * 60 * 60 * 1000) {
+          return;
+        }
+
+        const risk = getForecastRisk(forecast, data?.load_weight_lbs ?? 0);
+
+        features.push({
+          type: "Feature",
+          properties: {
+            intensity: riskIntensity(risk),
+            risk,
+          },
+          geometry: {
+            type: "Point",
+            coordinates: [point.coordinates[0], point.coordinates[1]],
+          },
+        });
+      });
     }
 
-    const targetTime = forecastBaseTime + forecastHour * 60 * 60 * 1000;
-
-    forecastPoints.forEach((point) => {
-      const forecast = nearestForecast(point.forecasts, targetTime);
-
-      if (!forecast) return;
-
-      const forecastTime = new Date(forecast.forecast_time).getTime();
-
-      // Do not show stale forecasts as if they
-      // represented the selected hour.
-      if (Math.abs(forecastTime - targetTime) > 3 * 60 * 60 * 1000) {
-        return;
-      }
-
-      const risk = getForecastRisk(forecast, data?.load_weight_lbs ?? 0);
-
-      const color = riskColor(risk);
-
-      const element = document.createElement("div");
-
-      element.style.width = "105px";
-      element.style.height = "105px";
-      element.style.borderRadius = "50%";
-      element.style.backgroundColor = color;
-      element.style.opacity = "0.23";
-      element.style.border = `2px solid ${color}`;
-      element.style.pointerEvents = "none";
-
-      const marker = new maplibregl.Marker({
-        element,
-        anchor: "center",
-      })
-        .setLngLat([point.coordinates[0], point.coordinates[1]])
-        .addTo(map);
-
-      heatMarkersRef.current.push(marker);
-    });
-
-    return () => {
-      heatMarkersRef.current.forEach((marker) => marker.remove());
-      heatMarkersRef.current = [];
+    const collection: GeoJSON.FeatureCollection<
+      GeoJSON.Point,
+      { intensity: number; risk: string }
+    > = {
+      type: "FeatureCollection",
+      features,
     };
+
+    const existingSource = map.getSource(HEAT_SOURCE) as
+      | maplibregl.GeoJSONSource
+      | undefined;
+
+    if (existingSource) {
+      existingSource.setData(collection);
+    } else {
+      map.addSource(HEAT_SOURCE, {
+        type: "geojson",
+        data: collection,
+      });
+    }
+
+    if (!map.getLayer(HEAT_LAYER)) {
+      const firstRouteLayer = routeLayersRef.current.find((id) =>
+        Boolean(map.getLayer(id)),
+      );
+
+      map.addLayer(
+        {
+          id: HEAT_LAYER,
+          type: "heatmap",
+          source: HEAT_SOURCE,
+          maxzoom: 16,
+          paint: {
+            "heatmap-weight": ["get", "intensity"],
+            "heatmap-intensity": [
+              "interpolate",
+              ["linear"],
+              ["zoom"],
+              4,
+              0.7,
+              10,
+              1.5,
+            ],
+            "heatmap-radius": [
+              "interpolate",
+              ["linear"],
+              ["zoom"],
+              4,
+              16,
+              8,
+              35,
+              12,
+              55,
+            ],
+            "heatmap-opacity": 0.7,
+            "heatmap-color": [
+              "interpolate",
+              ["linear"],
+              ["heatmap-density"],
+              0,
+              "rgba(0,0,0,0)",
+              0.1,
+              "#bbf7d0",
+              0.25,
+              "#22c55e",
+              0.4,
+              "#facc15",
+              0.6,
+              "#f97316",
+              0.8,
+              "#dc2626",
+              1,
+              "#7f1d1d",
+            ],
+          },
+        },
+        firstRouteLayer,
+      );
+    }
+
+    // Keep the heatmap behind route lines.
+    const firstRouteLayer = routeLayersRef.current.find((id) =>
+      Boolean(map.getLayer(id)),
+    );
+
+    if (firstRouteLayer && map.getLayer(HEAT_LAYER)) {
+      map.moveLayer(HEAT_LAYER, firstRouteLayer);
+    }
   }, [
     forecastPoints,
     forecastHour,
@@ -462,7 +544,7 @@ export default function RouteMap({ data }: Props) {
                 checked={showHeatmap}
                 onChange={(event) => setShowHeatmap(event.target.checked)}
               />
-              Overlay
+              Heatmap
             </label>
           </div>
 
@@ -496,9 +578,8 @@ export default function RouteMap({ data }: Props) {
 
           {forecastPoints.length > 0 && (
             <p className="mt-1 text-xs text-[#647480]">
-              Showing sampled weather risk along{" "}
-              {recommendedRoute?.name ?? "the route"}. Forecasts update every 3
-              hours.
+              Weather risk heatmap along {recommendedRoute?.name ?? "the route"}
+              . Forecasts update every 3 hours.
             </p>
           )}
 

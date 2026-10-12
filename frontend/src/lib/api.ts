@@ -27,6 +27,8 @@ export type CheckpointWeather = {
   precipitation_inches: number | null;
   rain_inches: number | null;
   snowfall_cm: number | null;
+  rain_inches_per_hour?: number | null;
+  snow_inches_per_hour?: number | null;
   wind_speed_mph: number | null;
   wind_gusts_mph: number | null;
   weather_code: number | null;
@@ -35,6 +37,7 @@ export type CheckpointWeather = {
 export type CheckpointRisk = {
   score: number | null;
   level: "low" | "moderate" | "high" | "unknown";
+  severity?: "low" | "moderate" | "high" | "severe" | "no_travel" | "unknown";
   factors: string[];
 };
 
@@ -52,6 +55,8 @@ export type RouteCheckpoint = {
 export type RouteRiskSummary = {
   average_score: number | null;
   maximum_score: number | null;
+  severe_miles?: number;
+  high_miles?: number;
   known_checkpoints: number;
   unknown_checkpoints: number;
   assessment_complete: boolean;
@@ -79,6 +84,8 @@ export type RouteRecommendation = {
   recommended_route_name?: string;
   average_risk_score?: number;
   maximum_risk_score?: number;
+  severe_miles?: number;
+  high_miles?: number;
   estimated_duration_minutes?: number;
   reason: string;
   evaluated_route_count?: number;
@@ -118,6 +125,8 @@ export interface HourlyWeatherForecast {
   precipitation_inches: number | null;
   rain_inches: number | null;
   snowfall_cm: number | null;
+  rain_inches_per_hour?: number | null;
+  snow_inches_per_hour?: number | null;
   wind_speed_mph: number | null;
   wind_gusts_mph: number | null;
   weather_code: number | null;
