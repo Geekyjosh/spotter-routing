@@ -137,7 +137,25 @@ export default function RouteMap({ data }: Props) {
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+      style: {
+        version: 8,
+        sources: {
+          "osm-tiles": {
+            type: "raster",
+            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            tileSize: 256,
+            attribution:
+              '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+          },
+        },
+        layers: [
+          {
+            id: "osm-background",
+            type: "raster",
+            source: "osm-tiles",
+          },
+        ],
+      },
       center: [-74.5, 40.4],
       zoom: 8,
     });
