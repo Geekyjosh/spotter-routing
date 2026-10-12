@@ -7,11 +7,13 @@ import requests
 from django.core.cache import cache
 from requests.exceptions import RequestException
 
+
 logger = logging.getLogger(__name__)
 
 OPENWEATHER_URL = (
     "https://api.openweathermap.org/data/2.5/forecast"
 )
+
 CACHE_SECONDS = 1800
 
 
@@ -21,13 +23,13 @@ class WeatherError(Exception):
 
 def _cache_key(latitude, longitude):
     return (
-        f"spotter:openweather:v1:"
-        f"{float(latitude):.3f}:{float(longitude):.3f}"
+        "spotter:openweather:v2:"
+        f"{float(latitude):.3f}:"
+        f"{float(longitude):.3f}"
     )
 
 
 def _weather_code(openweather_id):
-    """Convert OpenWeatherMap condition IDs to WMO codes."""
     if openweather_id is None:
         return None
 
@@ -35,20 +37,28 @@ def _weather_code(openweather_id):
 
     if 200 <= code < 300:
         return 95
+
     if 300 <= code < 400:
         return 51
+
     if 500 <= code < 600:
         return 65 if code >= 502 else 61
+
     if 600 <= code < 700:
         return 75 if code >= 602 else 71
+
     if 700 <= code < 800:
         return 45
+
     if code == 800:
         return 0
+
     if code == 801:
         return 1
+
     if code == 802:
         return 2
+
     if code in (803, 804):
         return 3
 
@@ -59,14 +69,18 @@ def fetch_weather(latitude, longitude):
     latitude = float(latitude)
     longitude = float(longitude)
 
-    key = os.getenv("OPENWEATHER_API_KEY")
+    api_key = os.getenv("OPENWEATHER_API_KEY")
 
-    if not key:
+    if not api_key:
         raise WeatherError(
             "OPENWEATHER_API_KEY is not configured."
         )
 
-    cache_key = _cache_key(latitude, longitude)
+    cache_key = _cache_key(
+        latitude,
+        longitude,
+    )
+
     cached = cache.get(cache_key)
 
     if cached is not None:
@@ -78,7 +92,7 @@ def fetch_weather(latitude, longitude):
             params={
                 "lat": latitude,
                 "lon": longitude,
-                "appid": key,
+                "appid": api_key,
                 "units": "metric",
             },
             timeout=20,
@@ -86,12 +100,12 @@ def fetch_weather(latitude, longitude):
 
         if response.status_code == 401:
             raise WeatherError(
-                "OpenWeatherMap API key is invalid or not active."
+                "OpenWeatherMap API key is invalid or inactive."
             )
 
         if response.status_code == 403:
             raise WeatherError(
-                "OpenWeatherMap access denied. Check your plan."
+                "OpenWeatherMap access denied."
             )
 
         if response.status_code == 429:
@@ -107,7 +121,12 @@ def fetch_weather(latitude, longitude):
                 "OpenWeatherMap returned invalid forecast data."
             )
 
-        cache.set(cache_key, data, CACHE_SECONDS)
+        cache.set(
+            cache_key,
+            data,
+            CACHE_SECONDS,
+        )
+
         return data
 
     except WeatherError:
@@ -115,8 +134,10 @@ def fetch_weather(latitude, longitude):
 
     except (RequestException, ValueError) as exc:
         logger.warning(
-            "OpenWeatherMap request failed: %s", exc
+            "OpenWeatherMap request failed: %s",
+            exc,
         )
+
         raise WeatherError(
             "Unable to retrieve weather forecast."
         ) from exc
@@ -124,10 +145,10 @@ def fetch_weather(latitude, longitude):
 
 def fetch_weather_batch(coordinates):
     """
-    Fetch forecasts for multiple locations.
-    OpenWeatherMap's standard forecast API
-    requires a separate request per location.
+    Fetch forecasts for multiple checkpoints.
+    Cached coordinates avoid repeated API requests.
     """
+
     return [
         fetch_weather(latitude, longitude)
         for latitude, longitude in coordinates
@@ -139,47 +160,79 @@ def _forecast_row(item):
     wind = item.get("wind") or {}
     rain = item.get("rain") or {}
     snow = item.get("snow") or {}
-    weather = item.get("weather") or []
+    conditions = item.get("weather") or []
 
-    condition = weather[0] if weather else {}
-
-    # OpenWeatherMap metric values:
-    # temperature: Celsius
-    # wind: metres/second
-    # rain and snow: millimetres per 3-hour period
+    condition = (
+        conditions[0]
+        if conditions
+        else {}
+    )
 
     temperature = main.get("temp")
     wind_speed = wind.get("speed")
     wind_gust = wind.get("gust")
 
-    rain_mm = rain.get("3h", 0)
-    snow_mm = snow.get("3h", 0)
+    # OpenWeatherMap provides precipitation totals
+    # in millimetres over a 3-hour forecast period.
+    rain_mm_3h = rain.get("3h", 0) or 0
+    snow_mm_3h = snow.get("3h", 0) or 0
+
+    rain_inches = rain_mm_3h / 25.4
+    snow_inches = snow_mm_3h / 25.4
+
+    # Approximate hourly average rates.
+    rain_inches_per_hour = rain_inches / 3
+    snow_inches_per_hour = snow_inches / 3
 
     return {
         "forecast_time": datetime.fromtimestamp(
             item["dt"],
             tz=timezone.utc,
         ).isoformat(),
+
         "temperature_f": (
             round(temperature * 9 / 5 + 32, 1)
             if temperature is not None
             else None
         ),
+
         "precipitation_inches": round(
-            (rain_mm + snow_mm) / 25.4, 3
+            rain_inches + snow_inches,
+            3,
         ),
-        "rain_inches": round(rain_mm / 25.4, 3),
-        "snowfall_cm": round(snow_mm / 10, 2),
+
+        "rain_inches": round(
+            rain_inches,
+            3,
+        ),
+
+        "snowfall_cm": round(
+            snow_mm_3h / 10,
+            2,
+        ),
+
+        "rain_inches_per_hour": round(
+            rain_inches_per_hour,
+            4,
+        ),
+
+        "snow_inches_per_hour": round(
+            snow_inches_per_hour,
+            4,
+        ),
+
         "wind_speed_mph": (
             round(wind_speed * 2.23694, 1)
             if wind_speed is not None
             else None
         ),
+
         "wind_gusts_mph": (
             round(wind_gust * 2.23694, 1)
             if wind_gust is not None
             else None
         ),
+
         "weather_code": _weather_code(
             condition.get("id")
         ),
@@ -199,7 +252,10 @@ def forecast_at_arrival(dataset, arrival_time):
             "No forecast data available."
         )
 
-    target = arrival_time.astimezone(timezone.utc)
+    target = arrival_time.astimezone(
+        timezone.utc
+    )
+
     nearest = min(
         entries,
         key=lambda item: abs(
@@ -231,17 +287,28 @@ def get_checkpoint_weather(
     arrival_time,
 ):
     return forecast_at_arrival(
-        fetch_weather(latitude, longitude),
+        fetch_weather(
+            latitude,
+            longitude,
+        ),
         arrival_time,
     )
 
 
-def get_48_hour_forecast(latitude, longitude):
+def get_48_hour_forecast(
+    latitude,
+    longitude,
+):
     """
-    Return forecast periods covering the next 48 hours.
-    Data is available every 3 hours, not hourly.
+    Return the available 3-hour forecast periods
+    covering the next 48 hours.
     """
-    dataset = fetch_weather(latitude, longitude)
+
+    dataset = fetch_weather(
+        latitude,
+        longitude,
+    )
+
     now = datetime.now(timezone.utc)
     end = now + timedelta(hours=48)
 
@@ -254,7 +321,9 @@ def get_48_hour_forecast(latitude, longitude):
         )
 
         if now <= forecast_time <= end:
-            forecasts.append(_forecast_row(item))
+            forecasts.append(
+                _forecast_row(item)
+            )
 
     if not forecasts:
         raise WeatherError(

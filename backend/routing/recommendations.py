@@ -1,13 +1,6 @@
 
 def recommend_safest_route(routes):
-    """
-    Recommend a route using illustrative weather risk scores.
-
-    Only routes with complete forecast coverage are eligible.
-    Prioritize maximum risk, then average risk, then duration.
-    """
-
-    eligible_routes = [
+    eligible = [
         route
         for route in routes
         if route.get("risk_summary", {}).get(
@@ -15,7 +8,7 @@ def recommend_safest_route(routes):
         )
     ]
 
-    if not eligible_routes:
+    if not eligible:
         return {
             "status": "unavailable",
             "recommended_route_id": None,
@@ -25,45 +18,51 @@ def recommend_safest_route(routes):
             ),
         }
 
-    ranked_routes = sorted(
-        eligible_routes,
+    ranked = sorted(
+        eligible,
         key=lambda route: (
-            route["risk_summary"]["maximum_score"],
+            route["risk_summary"]["severe_miles"],
+            route["risk_summary"]["high_miles"],
             route["risk_summary"]["average_score"],
             route["duration_minutes"],
         ),
     )
 
-    recommended = ranked_routes[0]
+    recommended = ranked[0]
     summary = recommended["risk_summary"]
 
-    incomplete_count = len(routes) - len(eligible_routes)
+    excluded_count = (
+        len(routes) - len(eligible)
+    )
 
-    if incomplete_count:
-        recommendation_status = "provisional"
-        explanation = (
-            f"{recommended['name']} has the lowest evaluated "
-            "weather risk among routes with complete forecasts. "
-            f"{incomplete_count} route(s) were excluded because "
-            "their forecast coverage was incomplete."
+    if excluded_count:
+        status = "provisional"
+        reason = (
+            f"{recommended['name']} ranks best among "
+            "routes with complete forecasts. "
+            "Other routes have incomplete weather coverage."
         )
     else:
-        recommendation_status = "complete"
-        explanation = (
+        status = "complete"
+        reason = (
             f"{recommended['name']} is preferred based on "
-            "the lowest maximum checkpoint risk, followed by "
-            "average weather risk and estimated travel time."
+            "fewest severe miles, fewest high-risk miles, "
+            "lowest average risk, and shortest travel time."
         )
 
     return {
-        "status": recommendation_status,
+        "status": status,
         "recommended_route_id": recommended["id"],
         "recommended_route_name": recommended["name"],
         "average_risk_score": summary["average_score"],
         "maximum_risk_score": summary["maximum_score"],
-        "estimated_duration_minutes": recommended["duration_minutes"],
-        "reason": explanation,
-        "evaluated_route_count": len(eligible_routes),
-        "excluded_route_count": incomplete_count,
+        "severe_miles": summary["severe_miles"],
+        "high_miles": summary["high_miles"],
+        "estimated_duration_minutes": (
+            recommended["duration_minutes"]
+        ),
+        "reason": reason,
+        "evaluated_route_count": len(eligible),
+        "excluded_route_count": excluded_count,
         "truck_restrictions_verified": False,
     }
