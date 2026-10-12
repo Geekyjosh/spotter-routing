@@ -217,7 +217,7 @@ def forecast_at_arrival(dataset, arrival_time):
         ) - target
     )
 
-    if difference > timedelta(hours=2):
+    if difference > timedelta(hours=3):
         raise WeatherError(
             "No forecast available near the arrival time."
         )
